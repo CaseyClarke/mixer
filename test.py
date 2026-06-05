@@ -6,17 +6,15 @@ import re
 
 NUM_SLIDERS = 4
 
-# Order still matters! Specific apps -> catch-all app -> master hardware device.
 rules = [
     {"name": "Firefox", "keyword": "youtube", "slider": 2, "label" : "Youtube Firefox"},
-    {"name": "discord", "keyword": None,      "slider": 3, "label" : "Discord"},
+    {"name": "discord", "slider": 3, "label" : "Discord"},
     {"special": "unmapped", "slider": 1, "label" : "Unmapped"},
     {"special": "default",   "slider": 0, "label" : "Master"} 
 ]
 
 old_volume = [0 * NUM_SLIDERS]
 sink_map = [{} for _ in range(NUM_SLIDERS)]
-
 
 async def match_rule(obj, facility, pulse):
     if facility == PulseEventFacilityEnum.sink_input:
@@ -30,6 +28,10 @@ async def match_rule(obj, facility, pulse):
 
         for rule in rules:
             if rule.get("name") and rule["name"].lower() in (app_name, app_binary):
+                return rule
+            
+        for rule in rules:
+            if rule.get("special") == "unmapped": #catch-all
                 return rule
 
     elif facility == PulseEventFacilityEnum.sink:
@@ -45,15 +47,8 @@ async def match_rule(obj, facility, pulse):
     else:
         raise NotImplementedError
     
-
-    #catch-all
-    for rule in rules:
-        if rule.get("special") == "unmapped":
-            return rule
-    
     return None # didn't match anything
     
-
 async def setvolume(data, pulse):
     global old_volume
     old_volume = []
@@ -76,102 +71,64 @@ async def handle_sliders(pulse):
             if re.fullmatch(r'^(100|\d{1,2})(?:\|(100|\d{1,2}))*$', data):
                 await setvolume(data, pulse)
 
-
 async def handle_subscription(pulse):
     try:
         async for event in pulse.subscribe_events('all'):
             if event.facility not in ('sink', 'sink_input'):
                 continue
 
-            # ==========================================
-            # CASE A: APPLICATION STREAM EVENTS
-            # ==========================================
             if event.facility == 'sink_input':
-                if event.t == 'remove':
-                    for i in range(len(sink_map)):
-                        sink_map[i].pop(event.index, None)
-                    continue
-
                 try:
                     stream = await pulse.sink_input_info(event.index)
                 except PulseIndexError:
                     continue
-
-                # 1. Track current and target sliders
-                current_slider = None
+            
+            elif event.facility == 'sink':
+                try:
+                    stream = await pulse.sink_info(event.index)
+                except PulseIndexError:
+                    continue
+                
+            if event.t == 'remove':
                 for i in range(len(sink_map)):
-                    if stream.index in sink_map[i]:
-                        current_slider = i
-                        break
+                    sink_map[i].pop(event.index, None)
+                continue
 
-                rule = await match_rule(stream, event.facility, pulse)
-                target_slider = rule.get("slider") if rule else None
+            # 1. Track current and target sliders
+            current_slider = None
+            for i in range(len(sink_map)):
+                if stream.index in sink_map[i]:
+                    current_slider = i
+                    break
 
+            rule = await match_rule(stream, event.facility, pulse)
+            target_slider = rule.get("slider") if rule else None
 
-                # 2. Smart Routing & Delta Checking Logic
-                if target_slider is not None:
-                    target_vol = old_volume[target_slider] / 100 if target_slider < len(old_volume) else 0.0
+            # 2. Smart Routing & Delta Checking Logic
+            if target_slider is not None:
+                target_vol = old_volume[target_slider] / 100 if target_slider < len(old_volume) else 0.0
 
-                    if current_slider == target_slider:
-                        # The app is on the right slider. Did a human change it externally?
-                        # (Using a delta threshold of 0.02 to absorb float rounding discrepancies)
-                        if abs(stream.volume.value_flat - target_vol) > 0.02:
-                            # EXTERNAL OVERRIDE DETECTED! Force it back to match the physical slider
-                            try:
-                                await pulse.volume_set_all_chans(stream, target_vol)
-                            except (PulseIndexError, PulseOperationFailed):
-                                sink_map[target_slider].pop(stream.index, None)
-                        else:
-                            # It's just our own echo. Update object silently, don't re-fire volume command.
-                            sink_map[target_slider][stream.index] = stream
-                    else:
-                        # It's a brand new app or it hopped rules (e.g. to YouTube)
-                        if current_slider is not None:
-                            sink_map[current_slider].pop(stream.index, None)
-                        
-                        sink_map[target_slider][stream.index] = stream
-                        
+                if current_slider == target_slider:
+                    if abs(stream.volume.value_flat - target_vol) > 0.02:
+                        # External override
                         try:
                             await pulse.volume_set_all_chans(stream, target_vol)
                         except (PulseIndexError, PulseOperationFailed):
                             sink_map[target_slider].pop(stream.index, None)
-
-            # ==========================================
-            # CASE B: HARDWARE DEVICE EVENTS (Master)
-            # ==========================================
-            elif event.facility == 'sink':
-                if event.t in ('change', 'new'):
-                    try:
-                        server_info = await pulse.server_info()
-                        sink = await pulse.sink_info(event.index)
-                    except PulseIndexError:
-                        continue
+                    else:
+                        # It's just our own echo
+                        sink_map[target_slider][stream.index] = stream
+                else:
+                    # It's a brand new app or it hopped rules (e.g. to YouTube)
+                    if current_slider is not None:
+                        sink_map[current_slider].pop(stream.index, None)
                     
-                    if sink.name == server_info.default_sink_name:
-                        rule = await match_rule(sink, event.facility, pulse)
-                        slider_idx = rule.get("slider") if rule else None
-                        if slider_idx is not None:
-                            target_vol = old_volume[slider_idx] / 100 if slider_idx < len(old_volume) else 0.0
-                            
-                            if sink.index in sink_map[slider_idx]:
-                                # Master sink already tracked. Did someone use keyboard media keys or OS UI?
-                                if abs(sink.volume.value_flat - target_vol) > 0.02:
-                                    # Snap master hardware volume back to physical potentiometer placement
-                                    try:
-                                        await pulse.volume_set_all_chans(sink, target_vol)
-                                    except (PulseIndexError, PulseOperationFailed):
-                                        sink_map[slider_idx].pop(sink.index, None)
-                                else:
-                                    sink_map[slider_idx][sink.index] = sink
-                            else:
-                                # Freshly connected or newly selected default device, initialize it
-                                sink_map[slider_idx].clear()
-                                sink_map[slider_idx][sink.index] = sink
-                                try:
-                                    await pulse.volume_set_all_chans(sink, target_vol)
-                                except (PulseIndexError, PulseOperationFailed):
-                                    sink_map[slider_idx].pop(sink.index, None)
-                            break
+                    sink_map[target_slider][stream.index] = stream
+                    
+                    try:
+                        await pulse.volume_set_all_chans(stream, target_vol)
+                    except (PulseIndexError, PulseOperationFailed):
+                        sink_map[target_slider].pop(stream.index, None)
 
     except PulseDisconnected:
         pass
@@ -179,22 +136,26 @@ async def handle_subscription(pulse):
         print(f"handle_subscription crashed: {e!r}")
         raise
 
-
 async def main():
     async with pulsectl_asyncio.PulseAsync('custom-mixer-daemon') as pulse:
-        for stream in await pulse.sink_input_list():
-            rule = await match_rule(stream, PulseEventFacilityEnum.sink_input, pulse)
-            slider_idx = rule.get("slider") if rule else None
-            if slider_idx is not None:
-                sink_map[slider_idx][stream.index] = stream
-                print(f"Startup: mapped slider {slider_idx} '{rule['label']}' to app stream {stream.index}")
-
-        for sink in await pulse.sink_list():
-            rule = await match_rule(sink, PulseEventFacilityEnum.sink, pulse)
-            slider_idx = rule.get("slider") if rule else None
-            if slider_idx is not None:
-                sink_map[slider_idx][sink.index] = sink
-                print(f"Startup: mapped slider {slider_idx} '{rule['label']}' to default hardware sink {sink.index}")
+        sink_inputs, sinks = await asyncio.gather(
+            pulse.sink_input_list(), 
+            pulse.sink_list()
+        )
+        
+        categories = [
+            (sink_inputs, PulseEventFacilityEnum.sink_input),
+            (sinks, PulseEventFacilityEnum.sink)
+        ]
+        
+        for items, facility_type in categories:
+            for item in items:
+                rule = await match_rule(item, facility_type, pulse)
+                slider_idx = rule.get("slider") if rule else None
+                
+                if slider_idx is not None:
+                    sink_map[slider_idx][item.index] = item
+                    print(f"Startup: mapped slider {slider_idx} '{rule['label']}' to {item.index}")
 
         sub_task = asyncio.create_task(handle_subscription(pulse))
         try:
@@ -206,7 +167,6 @@ async def main():
             except (asyncio.CancelledError, PulseDisconnected):
                 pass
             raise
-
 
 if __name__ == '__main__':
     asyncio.run(main())
