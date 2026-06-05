@@ -19,14 +19,15 @@ sink_map = [{} for _ in range(NUM_SLIDERS)]
 
 
 def match_rule(stream, rule, is_sink=False):
-    # If it's a hardware device event, it can ONLY match the master rule
+    # master can only match a sink, might change later to allow any arbitrary sink
     if rule.get("type") == "master":
         return is_sink  
         
+    # sinks can't match for applications which are the only thing below
     if is_sink:
-        return False # Hardware sinks cannot match application stream rules
+        return False 
         
-    # Catch-all for regular apps
+    # catch-all
     if rule.get("type") == "unmapped":
         return True   
     
@@ -39,17 +40,19 @@ def match_rule(stream, rule, is_sink=False):
     if not app_matches:
         return False
 
-    # If this rule targets a specific tab keyword, check if it's in the media title
+    # check if its both an app and a keyword
     if rule["keyword"]:
         return rule["keyword"].lower() in media_name
 
-    return True
+
+    return True #app but not keyword
 
 
 async def setvolume(data, pulse):
     global old_volume
-    old_volume = data
+    old_volume = []
     for i, volume in enumerate(data.split("|")):
+        old_volume.append(int(volume))
         if i >= len(sink_map):
             continue
 
@@ -58,6 +61,14 @@ async def setvolume(data, pulse):
                 await pulse.volume_set_all_chans(obj, int(volume) / 100)
             except (PulseIndexError, PulseOperationFailed):
                 sink_map[i].pop(idx, None)
+
+async def handle_sliders(pulse):
+    async with serialx.async_serial_for_url("/dev/pts/9", baudrate=9600) as serial:
+        while True:
+            data = await serial.readline()
+            data = data.decode("utf-8").strip()
+            if re.fullmatch(r'^(100|\d{1,2})(?:\|(100|\d{1,2}))*$', data):
+                await setvolume(data, pulse)
 
 
 async def handle_subscription(pulse):
@@ -95,8 +106,7 @@ async def handle_subscription(pulse):
 
                 # 2. Smart Routing & Delta Checking Logic
                 if target_slider is not None:
-                    vols = old_volume.split("|")
-                    target_vol = int(vols[target_slider]) / 100 if target_slider < len(vols) else 0.0
+                    target_vol = old_volume[target_slider] / 100 if target_slider < len(old_volume) else 0.0
 
                     if current_slider == target_slider:
                         # The app is on the right slider. Did a human change it externally?
@@ -137,8 +147,7 @@ async def handle_subscription(pulse):
                         for rule in rules:
                             if match_rule(sink, rule, is_sink=True):
                                 slider_idx = rule["slider"]
-                                vols = old_volume.split("|")
-                                target_vol = int(vols[slider_idx]) / 100 if slider_idx < len(vols) else 0.0
+                                target_vol = old_volume[slider_idx] / 100 if slider_idx < len(old_volume) else 0.0
                                 
                                 if sink.index in sink_map[slider_idx]:
                                     # Master sink already tracked. Did someone use keyboard media keys or OS UI?
@@ -165,15 +174,6 @@ async def handle_subscription(pulse):
     except Exception as e:
         print(f"handle_subscription crashed: {e!r}")
         raise
-
-
-async def handle_sliders(pulse):
-    async with serialx.async_serial_for_url("/dev/pts/9", baudrate=9600) as serial:
-        while True:
-            data = await serial.readline()
-            data = data.decode("utf-8").strip()
-            if re.fullmatch(r'^(100|\d{1,2})(?:\|(100|\d{1,2}))*$', data):
-                await setvolume(data, pulse)
 
 
 async def main():
