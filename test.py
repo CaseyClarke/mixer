@@ -4,13 +4,14 @@ import pulsectl_asyncio
 from pulsectl import PulseIndexError, PulseDisconnected, PulseOperationFailed, PulseEventFacilityEnum
 import re
 
-NUM_SLIDERS = 4
+NUM_SLIDERS = 5
 
 rules = [
-    {"name": "Firefox", "keyword": "youtube", "slider": 2, "label" : "Youtube Firefox"},
-    {"name": "discord", "slider": 3, "label" : "Discord"},
-    {"special": "unmapped", "slider": 1, "label" : "Unmapped"},
-    {"special": "default",   "slider": 0, "label" : "Master"} 
+    {"name": "Youtube", "keyword": "youtube", "slider": 2},
+    {"name": "Firefox", "slider": 4},
+    {"name": "discord", "slider": 3},
+    {"special": "unmapped", "slider": 1},
+    {"special": "default",   "slider": 0} 
 ]
 
 old_volume = [0 * NUM_SLIDERS]
@@ -88,13 +89,14 @@ async def handle_subscription(pulse):
                     stream = await pulse.sink_info(event.index)
                 except PulseIndexError:
                     continue
+            else:
+                raise NotImplementedError
                 
             if event.t == 'remove':
                 for i in range(len(sink_map)):
                     sink_map[i].pop(event.index, None)
                 continue
 
-            # 1. Track current and target sliders
             current_slider = None
             for i in range(len(sink_map)):
                 if stream.index in sink_map[i]:
@@ -102,10 +104,8 @@ async def handle_subscription(pulse):
                     break
 
             rule = await match_rule(stream, event.facility, pulse)
-            target_slider = rule.get("slider") if rule else None
-
-            # 2. Smart Routing & Delta Checking Logic
-            if target_slider is not None:
+            if rule is not None:
+                target_slider = rule.get("slider")
                 target_vol = old_volume[target_slider] / 100 if target_slider < len(old_volume) else 0.0
 
                 if current_slider == target_slider:
@@ -119,7 +119,7 @@ async def handle_subscription(pulse):
                         # It's just our own echo
                         sink_map[target_slider][stream.index] = stream
                 else:
-                    # It's a brand new app or it hopped rules (e.g. to YouTube)
+                    # It's a brand new app
                     if current_slider is not None:
                         sink_map[current_slider].pop(stream.index, None)
                     
@@ -151,11 +151,10 @@ async def main():
         for items, facility_type in categories:
             for item in items:
                 rule = await match_rule(item, facility_type, pulse)
-                slider_idx = rule.get("slider") if rule else None
-                
-                if slider_idx is not None:
+                if rule is not None:
+                    slider_idx = rule.get("slider")
                     sink_map[slider_idx][item.index] = item
-                    print(f"Startup: mapped slider {slider_idx} '{rule['label']}' to {item.index}")
+                    print(f"Startup: mapped slider {slider_idx} '{rule['name']}' to {item.index}")
 
         sub_task = asyncio.create_task(handle_subscription(pulse))
         try:

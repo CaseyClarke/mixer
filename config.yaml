@@ -1,0 +1,17 @@
+slider_mapping:
+  0: 
+    special : default
+  1: 
+    special : unmapped
+  2: 
+    name    : Firefox
+  3:
+    name    : Firefox
+    keyword : Youtube
+  4:
+    name    : Discord
+
+invert_sliders: false
+
+com_port: COM4
+baud_rate: 9600
